@@ -5,24 +5,21 @@ module Grape
     class << self
       attr_reader :combined_routes
 
-      alias original_mount mount
-
-      def mount(mounts)
-        original_mount mounts
-        @combined_routes ||= {}
-        mounts::routes.each do |route|
-          resource = route.route_path.match('\/(\w*?)[\.\/\(]').captures.first
-          next if resource.empty?
-          @combined_routes[resource.downcase] ||= []
-          @combined_routes[resource.downcase] << route
-        end
-      end
-
       def add_swagger_documentation(options={})
         documentation_class = create_documentation_class
 
         documentation_class.setup({:target_class => self}.merge(options))
         mount(documentation_class)
+
+        @combined_routes = {}
+        routes.each do |route|
+          resource = route.route_path.match('\/(\w*?)[\.\/\(]').captures.first
+          next if resource.empty?
+          resource.downcase!
+          @combined_routes[resource] ||= []
+          @combined_routes[resource] << route
+        end
+
       end
 
       private
@@ -43,7 +40,8 @@ module Grape
               :base_path => nil,
               :api_version => '0.1',
               :markdown => false,
-              :hide_documentation_path => false
+              :hide_documentation_path => false,
+              :hide_format => false
             }
             options = defaults.merge(options)
 
@@ -52,6 +50,7 @@ module Grape
             @@class_name = options[:class_name] || options[:mount_path].gsub('/','')
             @@markdown = options[:markdown]
             @@hide_documentation_path = options[:hide_documentation_path]
+            @@hide_format = options[:hide_format]
             api_version = options[:api_version]
             base_path = options[:base_path]
 
@@ -66,12 +65,13 @@ module Grape
               end
 
               routes_array = routes.keys.map do |local_route|
-                  { :path => "#{parse_path(route.route_path.gsub('(.:format)', ''),route.route_version)}/#{local_route}.{format}" }
+                  { :path => "#{parse_path(route.route_path.gsub('(.:format)', ''),route.route_version)}/#{local_route}#{@@hide_format ? '' : '.{format}'}" }
               end
+
               {
                 apiVersion: api_version,
                 swaggerVersion: "1.1",
-                basePath: base_path || request.base_url,
+                basePath: parse_base_path(base_path, request),
                 operations:[],
                 apis: routes_array
               }
@@ -86,7 +86,7 @@ module Grape
               header['Access-Control-Request-Method'] = '*'
               routes = @@target_class::combined_routes[params[:name]]
               routes_array = routes.map do |route|
-                notes = route.route_notes && @@markdown ? Kramdown::Document.new(route.route_notes.strip_heredoc).to_html : route.route_notes
+                notes = route.route_notes && @@markdown ? Kramdown::Document.new(strip_heredoc(route.route_notes)).to_html : route.route_notes
                 http_codes = parse_http_codes route.route_http_codes
                 operations = {
                     :notes => notes,
@@ -106,7 +106,7 @@ module Grape
               {
                 apiVersion: api_version,
                 swaggerVersion: "1.1",
-                basePath: base_path || request.base_url,
+                basePath: parse_base_path(base_path, request),
                 resourcePath: "",
                 apis: routes_array
               }
@@ -121,7 +121,7 @@ module Grape
                   value[:type] = 'file' if value.is_a?(Hash) && value[:type] == 'Rack::Multipart::UploadedFile'
 
                   dataType = value.is_a?(Hash) ? value[:type]||'String' : 'String'
-                  description = value.is_a?(Hash) ? value[:desc] : ''
+                  description = value.is_a?(Hash) ? value[:desc] || value[:description] : ''
                   required = value.is_a?(Hash) ? !!value[:required] : false
                   paramType = path.match(":#{param}") ? 'path' : (method == 'POST') ? 'form' : 'query'
                   name = (value.is_a?(Hash) && value[:full_name]) || param
@@ -161,7 +161,7 @@ module Grape
 
             def parse_path(path, version)
               # adapt format to swagger format
-              parsed_path = path.gsub('(.:format)', '.{format}')
+              parsed_path = path.gsub '(.:format)', ( @@hide_format ? '' : '.{format}')
               # This is attempting to emulate the behavior of
               # Rack::Mount::Strexp. We cannot use Strexp directly because
               # all it does is generate regular expressions for parsing URLs.
@@ -169,43 +169,35 @@ module Grape
               # parsed path.
               parsed_path = parsed_path.gsub(/:([a-zA-Z_]\w*)/, '{\1}')
               # add the version
-              parsed_path = parsed_path.gsub('{version}', version) if version
-              parsed_path
+              version ? parsed_path.gsub('{version}', version) : parsed_path
             end
+
             def parse_http_codes codes
               codes ||= {}
               codes.collect do |k, v|
-                {:code => k, :reason => v}
+                { code: k, reason: v }
               end
+            end
+
+            def try(*a, &b)
+              if a.empty? && block_given?
+                yield self
+              else
+                public_send(*a, &b) if respond_to?(a.first)
+              end
+            end
+
+            def strip_heredoc(string)
+              indent = string.scan(/^[ \t]*(?=\S)/).min.try(:size) || 0
+              string.gsub(/^[ \t]{#{indent}}/, '')
+            end
+
+            def parse_base_path(base_path, request)
+              (base_path.is_a?(Proc) ? base_path.call(request) : base_path) || request.base_url
             end
           end
         end
       end
     end
-  end
-end
-
-class Object
-  ##
-  #   @person ? @person.name : nil
-  # vs
-  #   @person.try(:name)
-  #
-  # File activesupport/lib/active_support/core_ext/object/try.rb#L32
-   def try(*a, &b)
-    if a.empty? && block_given?
-      yield self
-    else
-      __send__(*a, &b)
-    end
-  end
-end
-
-class String
-  # strip_heredoc from rails
-  # File activesupport/lib/active_support/core_ext/string/strip.rb, line 22
-  def strip_heredoc
-    indent = scan(/^[ \t]*(?=\S)/).min.try(:size) || 0
-    gsub(/^[ \t]{#{indent}}/, '')
   end
 end
